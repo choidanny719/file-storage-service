@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsTestProject>true</IsTestProject>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="4.0.1" />
+    <ProjectReference Include="../../src/FileStorage.Cli/FileStorage.Cli.csproj" />
+    <Using Include="Xunit" />
+  </ItemGroup>
+</Project>

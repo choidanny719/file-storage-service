@@ -3,5 +3,7 @@
 .vs/
 .env
 *.upload.json
+*.upload.json.lock
+__pycache__/
 TestResults/
 *.trx
