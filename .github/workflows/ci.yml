@@ -1,0 +1,30 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Build and test core
+        run: dotnet test --project tests/FileStorage.Core.Tests -c Release
+      - name: Start storage
+        run: docker compose up -d --wait postgres minio
+      - name: Integration tests
+        run: dotnet test --project tests/FileStorage.Api.Tests -c Release
+      - name: Build API container
+        run: docker compose build api
+      - name: Logs
+        if: failure()
+        run: docker compose logs
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v

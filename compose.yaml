@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: storage
+      POSTGRES_USER: storage
+      POSTGRES_PASSWORD: storage
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - metadata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storage -d storage"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - objects:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      ConnectionStrings__Metadata: Host=postgres;Database=storage;Username=storage;Password=storage
+      Storage__Endpoint: http://minio:9000
+      Storage__Bucket: file-storage
+      Storage__CreateBucket: "true"
+      Storage__ApiKeys__demo: ${FILE_STORAGE_TOKEN:-local-development-token-change-me-12345}
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_EC2_METADATA_DISABLED: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+volumes:
+  metadata:
+  objects:
