@@ -1,0 +1,7 @@
+**/bin/
+**/obj/
+.vs/
+.env
+*.upload.json
+TestResults/
+*.trx
