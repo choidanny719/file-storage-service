@@ -1,4 +1,5 @@
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -37,7 +38,7 @@ for attempt in range(60):
     try:
         request("/health/ready")
         break
-    except (urllib.error.URLError, TimeoutError):
+    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
         if attempt == 59:
             raise
         time.sleep(1)

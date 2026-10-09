@@ -26,7 +26,7 @@ jobs:
         run: docker compose build api
       - name: CLI acceptance
         run: |
-          docker compose up -d api
+          docker compose up -d --no-deps api
           python3 tests/acceptance.py
       - name: Logs
         if: failure()

@@ -73,4 +73,13 @@ public class ManifestTests
         var request = Valid() with { Size = 2, Chunks = [new(Hash, 1), new(Hash, 1)] };
         Assert.Null(Manifest.Validate(request));
     }
+
+    [Fact]
+    public void MaximumFileAndChunkCountAreAccepted()
+    {
+        var chunks = Enumerable.Repeat(new ChunkInfo(Hash, Chunker.MinSize), Manifest.MaxChunks).ToArray();
+        var request = new UploadRequest(null, "largest.bin", Manifest.MaxFileSize, Hash, chunks);
+        Assert.Null(Manifest.Validate(request));
+        Assert.NotNull(Manifest.Validate(request with { Size = request.Size + 1 }));
+    }
 }

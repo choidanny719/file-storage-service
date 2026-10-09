@@ -29,7 +29,7 @@ public sealed class UploadTests(StorageFixture fixture) : IClassFixture<StorageF
         Assert.Equal(data, await response.Content.ReadAsByteArrayAsync(Ct));
         Assert.Equal(size, response.Content.Headers.ContentLength);
         Assert.Equal(request.Sha256, response.Headers.GetValues("X-Content-SHA256").Single());
-        Assert.Contains("filename*=UTF-8", response.Content.Headers.ContentDisposition!.ToString());
+        Assert.Contains("filename*=UTF-8", response.Content.Headers.ContentDisposition!.ToString(), StringComparison.OrdinalIgnoreCase);
         var files = await client.GetFromJsonAsync<FileEntry[]>("/v1/files", Ct);
         Assert.Single(files!);
         Assert.Equal("résumé data.bin", files![0].Name);
@@ -288,6 +288,64 @@ public sealed class UploadTests(StorageFixture fixture) : IClassFixture<StorageF
         }
         finally { await fixture.SqlAsync("ALTER TABLE versions DROP CONSTRAINT reject_test"); }
         Assert.Equal(1, (await Complete(client, upload.Id)).Number);
+    }
+
+    [Fact]
+    public async Task FailedChunkMetadataWriteCanBeRetried()
+    {
+        using var client = fixture.Client();
+        byte[] data = [42, 43, 44];
+        var (upload, request) = await Create(client, data);
+        await fixture.SqlAsync("ALTER TABLE chunks ADD CONSTRAINT reject_chunk_test CHECK (size<0)");
+        try
+        {
+            using var response = await client.PutAsync($"/v1/uploads/{upload.Id}/chunks/{request.Sha256}", new ByteArrayContent(data), Ct);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+            Assert.Single((await client.GetFromJsonAsync<UploadStatus>($"/v1/uploads/{upload.Id}", Ct))!.Missing);
+        }
+        finally { await fixture.SqlAsync("ALTER TABLE chunks DROP CONSTRAINT reject_chunk_test"); }
+        await Put(client, upload.Id, new(request.Sha256, data));
+        Assert.Equal(data, await client.GetByteArrayAsync(Content(await Complete(client, upload.Id)), Ct));
+    }
+
+    [Fact]
+    public async Task ConcurrentSessionCreationUsesOneIdempotentSession()
+    {
+        using var client = fixture.Client();
+        var request = await Manifest.CreateAsync(Stream.Null, "empty", cancellationToken: Ct);
+        var sessions = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => Create(client, request, "concurrent-create")));
+        Assert.Single(sessions.Select(s => s.Id).Distinct());
+        using var bob = fixture.Client(StorageFixture.BobToken);
+        var anotherUser = await Create(bob, request, "concurrent-create");
+        Assert.NotEqual(sessions[0].Id, anotherUser.Id);
+    }
+
+    [Fact]
+    public async Task UnknownResourcesReturnNotFound()
+    {
+        using var client = fixture.Client();
+        var id = Guid.NewGuid();
+        using var session = await client.GetAsync($"/v1/uploads/{id}", Ct);
+        using var history = await client.GetAsync($"/v1/files/{id}/versions", Ct);
+        using var completion = await client.PostAsync($"/v1/uploads/{id}/complete", null, Ct);
+        Assert.Equal(HttpStatusCode.NotFound, session.StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, history.StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, completion.StatusCode);
+    }
+
+    [Fact]
+    public async Task ExpiredStatusAndCompletedChunkWritesAreRejected()
+    {
+        using var client = fixture.Client();
+        var (expired, _) = await Create(client, []);
+        await fixture.SqlAsync("UPDATE uploads SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", expired.Id);
+        using var status = await client.GetAsync($"/v1/uploads/{expired.Id}", Ct);
+        Assert.Equal(HttpStatusCode.Gone, status.StatusCode);
+        var (completed, request) = await Create(client, [1]);
+        await SendMissing(client, completed, [1]);
+        await Complete(client, completed.Id);
+        using var write = await client.PutAsync($"/v1/uploads/{completed.Id}/chunks/{request.Sha256}", new ByteArrayContent([1]), Ct);
+        Assert.Equal(HttpStatusCode.Conflict, write.StatusCode);
     }
 
     private async Task<(UploadStatus Upload, UploadRequest Request)> Create(HttpClient client, byte[] data, Guid? fileId = null, string name = "file.bin", string? key = null)

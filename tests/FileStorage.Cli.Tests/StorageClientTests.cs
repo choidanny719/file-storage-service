@@ -129,6 +129,31 @@ public sealed class StorageClientTests : IDisposable
         Assert.Equal(1, server.Completes);
     }
 
+    [Fact]
+    public async Task InterruptedDownloadRemovesItsPartialFile()
+    {
+        using var http = Client(_ =>
+        {
+            var response = Download([1, 2], Chunker.Hash([1, 2]));
+            response.Content = new StreamContent(new InterruptedStream());
+            return Task.FromResult(response);
+        });
+        await Assert.ThrowsAsync<IOException>(() => new StorageClient(http).DownloadAsync(Guid.NewGuid(), Guid.NewGuid(), Path.Combine(directory, "partial"), Ct));
+        Assert.Empty(Directory.GetFiles(directory));
+    }
+
+    private sealed class InterruptedStream : MemoryStream
+    {
+        private bool read;
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (read) throw new IOException("Connection closed.");
+            read = true;
+            buffer.Span[0] = 1;
+            return ValueTask.FromResult(1);
+        }
+    }
+
     private static HttpResponseMessage Download(byte[] data, string? checksum)
     {
         var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(data) };
