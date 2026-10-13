@@ -25,7 +25,7 @@ public sealed class StorageFixture : IAsyncLifetime
     public async ValueTask InitializeAsync()
     {
         var connection = Environment.GetEnvironmentVariable("TEST_DATABASE") ?? "Host=localhost;Port=5432;Database=storage;Username=storage;Password=storage";
-        ConnectionString = new NpgsqlConnectionStringBuilder(connection) { SearchPath = schema }.ConnectionString;
+        ConnectionString = new NpgsqlConnectionStringBuilder(connection) { SearchPath = schema, ApplicationName = schema }.ConnectionString;
         await using (var db = new NpgsqlConnection(connection))
         {
             await db.OpenAsync(TestContext.Current.CancellationToken);

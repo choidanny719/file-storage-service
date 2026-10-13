@@ -5,7 +5,7 @@ using FileStorage.Core;
 
 namespace FileStorage.Api.Tests;
 
-public sealed class UploadTests(StorageFixture fixture) : IClassFixture<StorageFixture>, IAsyncLifetime
+public sealed partial class UploadTests(StorageFixture fixture) : IClassFixture<StorageFixture>, IAsyncLifetime
 {
     private CancellationToken Ct => TestContext.Current.CancellationToken;
     public ValueTask InitializeAsync() => new(fixture.SqlAsync("TRUNCATE uploads,versions,files,chunks CASCADE"));
