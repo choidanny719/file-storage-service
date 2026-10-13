@@ -142,6 +142,200 @@ public sealed class StorageClientTests : IDisposable
         Assert.Empty(Directory.GetFiles(directory));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EmptyOrAlreadyStoredContentDoesNotSendChunks(bool empty)
+    {
+        var path = Path.Combine(directory, "file.bin");
+        var data = empty ? [] : new byte[3 * Chunker.MaxSize];
+        await File.WriteAllBytesAsync(path, data, Ct);
+        var server = new UploadServer();
+        if (!empty)
+        {
+            var chunk = new byte[Chunker.MaxSize];
+            server.Stored[Chunker.Hash(chunk)] = chunk;
+        }
+        using var http = Client(server.Send);
+        var result = await new StorageClient(http).UploadAsync(path, null, path + ".upload.json", Ct);
+        Assert.Empty(server.Attempts);
+        Assert.Equal(Chunker.Hash(data), result.Sha256);
+        Assert.Equal(1, server.Completes);
+        Assert.False(File.Exists(path + ".upload.json"));
+    }
+
+    [Fact]
+    public async Task RepeatedChunksAreUploadedOnlyOnce()
+    {
+        var path = Path.Combine(directory, "repeated.bin");
+        await File.WriteAllBytesAsync(path, new byte[3 * Chunker.MaxSize], Ct);
+        var server = new UploadServer();
+        using var http = Client(server.Send);
+        await new StorageClient(http).UploadAsync(path, null, path + ".upload.json", Ct);
+        Assert.Equal(3, server.Request!.Chunks.Length);
+        Assert.Single(server.Stored);
+        Assert.Equal(1, Assert.Single(server.Attempts).Value);
+    }
+
+    [Theory]
+    [InlineData("server")]
+    [InlineData("name")]
+    [InlineData("file-id")]
+    public async Task ResumeStateCannotBeReusedForADifferentTarget(string changed)
+    {
+        var path = Path.Combine(directory, "file.bin");
+        var state = path + ".upload.json";
+        await File.WriteAllBytesAsync(path, [1], Ct);
+        var server = new UploadServer { FailPut = 1 };
+        using var http = Client(server.Send);
+        await Assert.ThrowsAsync<HttpRequestException>(() => new StorageClient(http).UploadAsync(path, null, state, Ct));
+        var saved = await File.ReadAllTextAsync(state, Ct);
+        using var resumed = Client(server.Send);
+        if (changed == "server") resumed.BaseAddress = new Uri("https://other.example.com/");
+        if (changed == "name")
+        {
+            var renamed = Path.Combine(directory, "renamed.bin");
+            File.Move(path, renamed);
+            path = renamed;
+        }
+        Guid? fileId = changed == "file-id" ? Guid.NewGuid() : null;
+        await Assert.ThrowsAsync<InvalidDataException>(() => new StorageClient(resumed).UploadAsync(path, fileId, state, Ct));
+        Assert.Equal(saved, await File.ReadAllTextAsync(state, Ct));
+        Assert.Equal(1, server.Creates);
+        Assert.Equal(0, server.Completes);
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("{broken")]
+    public async Task InvalidResumeStateDoesNotContactTheServer(string json)
+    {
+        var path = Path.Combine(directory, "file.bin");
+        var state = path + ".upload.json";
+        await File.WriteAllBytesAsync(path, [1], Ct);
+        await File.WriteAllTextAsync(state, json, Ct);
+        var contacted = false;
+        using var http = Client(_ => { contacted = true; throw new InvalidOperationException("Unexpected request."); });
+        var failure = await Record.ExceptionAsync(() => new StorageClient(http).UploadAsync(path, null, state, Ct));
+        if (json == "null") Assert.IsType<InvalidDataException>(failure);
+        else Assert.IsType<JsonException>(failure);
+        Assert.False(contacted);
+        Assert.Equal(json, await File.ReadAllTextAsync(state, Ct));
+    }
+
+    [Fact]
+    public async Task AbortedUploadKeepsStateAndDoesNotSendContent()
+    {
+        var path = Path.Combine(directory, "file.bin");
+        await File.WriteAllBytesAsync(path, [1], Ct);
+        var calls = 0;
+        using var http = Client(message =>
+        {
+            calls++;
+            Assert.Equal(HttpMethod.Post, message.Method);
+            var status = new UploadStatus(Guid.NewGuid(), Guid.NewGuid(), "aborted", DateTimeOffset.UtcNow, [], null);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Created) { Content = JsonContent.Create(status) });
+        });
+        await Assert.ThrowsAsync<InvalidOperationException>(() => new StorageClient(http).UploadAsync(path, null, path + ".upload.json", Ct));
+        Assert.Equal(1, calls);
+        Assert.True(File.Exists(path + ".upload.json"));
+    }
+
+    [Fact]
+    public async Task UnknownMissingChunkPreventsCompletion()
+    {
+        var path = Path.Combine(directory, "file.bin");
+        await File.WriteAllBytesAsync(path, [1], Ct);
+        var calls = 0;
+        using var http = Client(message =>
+        {
+            calls++;
+            Assert.Equal("/v1/uploads", message.RequestUri!.AbsolutePath);
+            var status = new UploadStatus(Guid.NewGuid(), Guid.NewGuid(), "pending", DateTimeOffset.UtcNow.AddHours(1), [Chunker.Hash([2])], null);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Created) { Content = JsonContent.Create(status) });
+        });
+        await Assert.ThrowsAsync<InvalidDataException>(() => new StorageClient(http).UploadAsync(path, null, path + ".upload.json", Ct));
+        Assert.Equal(1, calls);
+        Assert.True(File.Exists(path + ".upload.json"));
+    }
+
+    [Fact]
+    public async Task ExpiredSessionPreservesResumeStateForInspection()
+    {
+        var path = Path.Combine(directory, "file.bin");
+        var state = path + ".upload.json";
+        await File.WriteAllBytesAsync(path, [1], Ct);
+        using var first = Client(new UploadServer { FailPut = 1 }.Send);
+        await Assert.ThrowsAsync<HttpRequestException>(() => new StorageClient(first).UploadAsync(path, null, state, Ct));
+        var saved = await File.ReadAllTextAsync(state, Ct);
+        using var resumed = Client(message =>
+        {
+            Assert.Equal(HttpMethod.Get, message.Method);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.Gone) { Content = new StringContent("expired") });
+        });
+        var error = await Assert.ThrowsAsync<HttpRequestException>(() => new StorageClient(resumed).UploadAsync(path, null, state, Ct));
+        Assert.Equal(HttpStatusCode.Gone, error.StatusCode);
+        Assert.Equal(saved, await File.ReadAllTextAsync(state, Ct));
+    }
+
+    [Fact]
+    public async Task DestinationCreatedDuringDownloadIsPreserved()
+    {
+        var destination = Path.Combine(directory, "race.bin");
+        using var http = Client(async _ =>
+        {
+            await File.WriteAllTextAsync(destination, "other writer", Ct);
+            return Download([1], Chunker.Hash([1]));
+        });
+        await Assert.ThrowsAsync<IOException>(() => new StorageClient(http).DownloadAsync(Guid.NewGuid(), Guid.NewGuid(), destination, Ct));
+        Assert.Equal("other writer", await File.ReadAllTextAsync(destination, Ct));
+        Assert.Single(Directory.GetFiles(directory));
+    }
+
+    [Fact]
+    public async Task CanceledDownloadRemovesItsPartialFile()
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        using var http = Client(_ =>
+        {
+            var response = Download([1, 2], Chunker.Hash([1, 2]));
+            response.Content = new StreamContent(new CancelingStream(cancellation));
+            return Task.FromResult(response);
+        });
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new StorageClient(http).DownloadAsync(Guid.NewGuid(), Guid.NewGuid(), Path.Combine(directory, "canceled"), cancellation.Token));
+        Assert.Empty(Directory.GetFiles(directory));
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("{broken")]
+    public async Task InvalidJsonResponsesAreNotTreatedAsEmptyLists(string body)
+    {
+        using var http = Client(_ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json")
+        }));
+        var failure = await Record.ExceptionAsync(() => new StorageClient(http).GetAsync<FileEntry[]>("v1/files", Ct));
+        if (body == "null") Assert.IsType<InvalidDataException>(failure);
+        else Assert.IsType<JsonException>(failure);
+    }
+
+    private sealed class CancelingStream(CancellationTokenSource cancellation) : MemoryStream
+    {
+        private bool read;
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (read)
+            {
+                cancellation.Cancel();
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            read = true;
+            buffer.Span[0] = 1;
+            return ValueTask.FromResult(1);
+        }
+    }
+
     private sealed class InterruptedStream : MemoryStream
     {
         private bool read;
