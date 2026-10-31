@@ -320,6 +320,164 @@ public sealed class StorageClientTests : IDisposable
         else Assert.IsType<JsonException>(failure);
     }
 
+    [Fact]
+    public async Task FailedCompletionResumesWithoutResendingStoredChunks()
+    {
+        var path = Path.Combine(directory, "retry.bin");
+        var state = path + ".upload.json";
+        byte[] data = [10, 20, 30];
+        await File.WriteAllBytesAsync(path, data, Ct);
+        var server = new UploadServer();
+        var reject = true;
+        using var http = Client(message =>
+        {
+            if (reject && message.RequestUri!.AbsolutePath.EndsWith("/complete", StringComparison.Ordinal))
+            {
+                reject = false;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                {
+                    Content = new StringContent("retry completion")
+                });
+            }
+            return server.Send(message);
+        });
+        var client = new StorageClient(http);
+        var error = await Assert.ThrowsAsync<HttpRequestException>(() => client.UploadAsync(path, null, state, Ct));
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, error.StatusCode);
+        Assert.True(File.Exists(state));
+        Assert.Equal(0, server.Completes);
+        var version = await client.UploadAsync(path, null, state, Ct);
+        Assert.Equal(Chunker.Hash(data), version.Sha256);
+        Assert.Equal(1, server.Creates);
+        Assert.Equal(1, server.Completes);
+        Assert.Equal(1, Assert.Single(server.Attempts).Value);
+        Assert.False(File.Exists(state));
+        Assert.Empty(Directory.GetFiles(directory, "*.tmp"));
+    }
+
+    [Theory]
+    [InlineData("create")]
+    [InlineData("chunk")]
+    [InlineData("complete")]
+    public async Task CanceledUploadsKeepResumableStateAndReleaseTheStateLock(string stage)
+    {
+        var path = Path.Combine(directory, "cancel.bin");
+        var state = path + ".upload.json";
+        byte[] data = [11, 22, 33];
+        await File.WriteAllBytesAsync(path, data, Ct);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var server = new UploadServer();
+        using var interrupted = Client(message =>
+        {
+            var matches = stage switch
+            {
+                "create" => message.Method == HttpMethod.Post && message.RequestUri!.AbsolutePath == "/v1/uploads",
+                "chunk" => message.Method == HttpMethod.Put,
+                _ => message.RequestUri!.AbsolutePath.EndsWith("/complete", StringComparison.Ordinal)
+            };
+            if (matches)
+            {
+                cancellation.Cancel();
+                throw new OperationCanceledException(cancellation.Token);
+            }
+            return server.Send(message);
+        });
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new StorageClient(interrupted).UploadAsync(path, null, state, cancellation.Token));
+        Assert.True(File.Exists(state));
+        Assert.Empty(Directory.GetFiles(directory, "*.tmp"));
+        using var saved = JsonDocument.Parse(await File.ReadAllTextAsync(state, Ct));
+        var key = saved.RootElement.GetProperty("key").GetString();
+        Assert.False(string.IsNullOrEmpty(key));
+        using var resumed = Client(server.Send);
+        var version = await new StorageClient(resumed).UploadAsync(path, null, state, Ct);
+        Assert.Equal(Chunker.Hash(data), version.Sha256);
+        Assert.Equal(key, Assert.Single(server.Keys));
+        Assert.Equal(1, server.Creates);
+        Assert.Equal(1, server.Completes);
+        Assert.Equal(1, Assert.Single(server.Attempts).Value);
+        Assert.False(File.Exists(state));
+    }
+
+    [Fact]
+    public async Task ConcurrentUploadsCannotShareAStateFile()
+    {
+        var path = Path.Combine(directory, "locked.bin");
+        var state = path + ".upload.json";
+        await File.WriteAllBytesAsync(path, [1, 2, 3], Ct);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var server = new UploadServer();
+        using var first = Client(async message =>
+        {
+            if (message.RequestUri!.AbsolutePath == "/v1/uploads")
+            {
+                entered.TrySetResult();
+                await release.Task.WaitAsync(Ct);
+            }
+            return await server.Send(message);
+        });
+        var running = new StorageClient(first).UploadAsync(path, null, state, Ct);
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10), Ct);
+            var before = await File.ReadAllTextAsync(state, Ct);
+            var requests = 0;
+            using var second = Client(message => { requests++; return server.Send(message); });
+            await Assert.ThrowsAsync<IOException>(() => new StorageClient(second).UploadAsync(path, null, state, Ct));
+            Assert.Equal(0, requests);
+            Assert.Equal(before, await File.ReadAllTextAsync(state, Ct));
+        }
+        finally
+        {
+            release.TrySetResult();
+            await running;
+        }
+        Assert.Equal(1, server.Creates);
+        Assert.Equal(1, server.Completes);
+        Assert.False(File.Exists(state));
+    }
+
+    [Fact]
+    public async Task AFailedStatusRequestPreservesStateAndCanBeRetried()
+    {
+        var path = Path.Combine(directory, "status.bin");
+        var state = path + ".upload.json";
+        await File.WriteAllBytesAsync(path, [2, 4, 6], Ct);
+        var server = new UploadServer { FailPut = 1 };
+        using var http = Client(server.Send);
+        var client = new StorageClient(http);
+        await Assert.ThrowsAsync<HttpRequestException>(() => client.UploadAsync(path, null, state, Ct));
+        var before = await File.ReadAllTextAsync(state, Ct);
+        using var unavailable = Client(message =>
+        {
+            Assert.Equal(HttpMethod.Get, message.Method);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+            {
+                Content = new StringContent("storage unavailable")
+            });
+        });
+        var error = await Assert.ThrowsAsync<HttpRequestException>(() => new StorageClient(unavailable).UploadAsync(path, null, state, Ct));
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, error.StatusCode);
+        Assert.Equal(before, await File.ReadAllTextAsync(state, Ct));
+        var version = await client.UploadAsync(path, null, state, Ct);
+        Assert.Equal(Chunker.Hash([2, 4, 6]), version.Sha256);
+        Assert.Equal(1, server.Creates);
+        Assert.Equal(1, server.Completes);
+        Assert.False(File.Exists(state));
+    }
+
+    [Fact]
+    public async Task DownloadsLargerThanTheReadBufferPreserveEveryByte()
+    {
+        var data = new byte[3 * 65536 + 17];
+        new Random(23).NextBytes(data);
+        var destination = Path.Combine(directory, "large.bin");
+        using var http = Client(_ => Task.FromResult(Download(data, Chunker.Hash(data))));
+        await new StorageClient(http).DownloadAsync(Guid.NewGuid(), Guid.NewGuid(), destination, Ct);
+        Assert.Equal(data, await File.ReadAllBytesAsync(destination, Ct));
+        Assert.Single(Directory.GetFiles(directory));
+    }
+
     private sealed class CancelingStream(CancellationTokenSource cancellation) : MemoryStream
     {
         private bool read;
