@@ -34,7 +34,8 @@ public sealed partial class UploadTests
         finally
         {
             cancellation.Cancel();
-            await gate.CloseAsync();
+            await using var release = new NpgsqlCommand("SELECT pg_advisory_unlock(hashtextextended('alice',0))", gate);
+            await release.ExecuteNonQueryAsync(CancellationToken.None);
             await completion;
         }
         Assert.Equal(before, await client.GetFromJsonAsync<FileEntry[]>("/v1/files", Ct));
@@ -72,7 +73,8 @@ public sealed partial class UploadTests
         }
         finally
         {
-            await gate.CloseAsync();
+            await using var release = new NpgsqlCommand("SELECT pg_advisory_unlock(hashtextextended('alice',0))", gate);
+            await release.ExecuteNonQueryAsync(CancellationToken.None);
             await completion;
         }
         var fault = Assert.IsType<ApiFault>(await completion);
