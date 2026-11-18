@@ -96,10 +96,29 @@ public sealed partial class UploadTests(StorageFixture fixture) : IClassFixture<
     {
         using var client = fixture.Client();
         var (initial, _) = await Create(client, []);
-        await Complete(client, initial.Id);
-        var sessions = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => Create(client, [], initial.FileId)));
+        var original = await Complete(client, initial.Id);
+        var sessions = await Task.WhenAll(Enumerable.Range(1, 4).Select(async i =>
+        {
+            byte[] data = [(byte)i];
+            var (upload, request) = await Create(client, data, initial.FileId, $"revision-{i}.bin");
+            await SendMissing(client, upload, data);
+            return (Upload: upload, Request: request, Data: data);
+        }));
         var versions = await Task.WhenAll(sessions.Select(s => Complete(client, s.Upload.Id)));
         Assert.Equal(new[] { 2, 3, 4, 5 }, versions.Select(v => v.Number).Order());
+        for (var i = 0; i < sessions.Length; i++)
+        {
+            Assert.Equal(sessions[i].Request.Name, versions[i].Name);
+            Assert.Equal(sessions[i].Request.Sha256, versions[i].Sha256);
+            Assert.Equal(sessions[i].Data, await client.GetByteArrayAsync(Content(versions[i]), Ct));
+            Assert.Equal(versions[i], await Complete(client, sessions[i].Upload.Id));
+        }
+        var history = (await client.GetFromJsonAsync<FileVersion[]>($"/v1/files/{initial.FileId}/versions", Ct))!;
+        Assert.Equal(versions.Append(original).OrderByDescending(v => v.Number), history);
+        var entry = Assert.Single((await client.GetFromJsonAsync<FileEntry[]>("/v1/files", Ct))!);
+        Assert.Equal(versions.MaxBy(v => v.Number)!.Name, entry.Name);
+        Assert.Equal(5, entry.Versions);
+        Assert.Empty(await client.GetByteArrayAsync(Content(original), Ct));
     }
 
     [Fact]
